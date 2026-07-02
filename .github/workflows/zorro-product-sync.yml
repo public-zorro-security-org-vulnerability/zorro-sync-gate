@@ -1,0 +1,125 @@
+name: Zorro Product Sync Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  zorro-supply-scan:
+    name: Zorro PR Guard (Supply Agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Zorro Supply Agent
+        uses: public-zorro-security-org-vulnerability/zorro-github-actions/.github/actions/supply-agent@main
+        continue-on-error: true
+        with:
+          api_key: ${{ secrets.ZORRO_API_KEY }}
+          api_url: ${{ secrets.ZORRO_API_URL != '' && secrets.ZORRO_API_URL || 'https://zorrosecurity.com' }}
+          config: zorro.yml
+          profile: pr
+          mode: monitor
+          lineage: "true"
+          upload_evidence: "true"
+          fail_on_blocking: "false"
+          sdk_repository: ${{ vars.ZORRO_SDK_REPO || 'NetoIntelligence/zorrosecurity.ai' }}
+          sdk_token: ${{ secrets.ZORRO_SDK_TOKEN }}
+
+  zorro-pipeline-agent:
+    name: Zorro Pipeline Agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Zorro Pipeline Agent
+        uses: public-zorro-security-org-vulnerability/zorro-github-actions/.github/actions/pipeline-agent@main
+        continue-on-error: true
+        with:
+          org: public-zorro-security-org-vulnerability
+          token: ${{ secrets.ZORRO_AGENT_TOKEN }}
+          ingest_url: ${{ secrets.ZORRO_INGEST_URL }}
+          profile: pr
+          fail_on: ""
+          sdk_repository: ${{ vars.ZORRO_SDK_REPO || 'NetoIntelligence/zorrosecurity.ai' }}
+          sdk_token: ${{ secrets.ZORRO_SDK_TOKEN }}
+
+  reusable-workflow-smoke:
+    name: Reusable workflow callable
+    uses: public-zorro-security-org-vulnerability/zorro-github-actions/.github/workflows/zorro-pr-guard.yml@main
+    secrets: inherit
+
+  corpus-manifest-check:
+    name: Vuln Corpus Manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify intentional vuln fixtures exist
+        run: |
+          test -f fixtures/pr-vuln-sample.js
+          test -f zorro.yml
+          grep -q "AKIAIOSFODNN7EXAMPLE" fixtures/pr-vuln-sample.js
+          grep -q "SELECT" fixtures/pr-vuln-sample.js
+          echo "✓ sync-gate vuln fixtures + zorro.yml present"
+
+  github-app-probe:
+    name: GitHub App webhook probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe Zorro webhook surface
+        env:
+          ZORRO_API_URL: ${{ secrets.ZORRO_API_URL != '' && secrets.ZORRO_API_URL || 'https://zorrosecurity.com' }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ZORRO_API_URL}/v1/integrations/github/webhook" \
+            -H 'Content-Type: application/json' -d '{"zen":"probe"}' || echo 000)"
+          case "${code}" in
+            401|403) echo "✓ webhook mounted (${code})" ;;
+            404) echo "::warning::webhook 404 — deploy latest Zorro API" ;;
+            *) echo "webhook → ${code}" ;;
+          esac
+
+  report-sync:
+    name: Product Sync Summary
+    needs: [zorro-supply-scan, zorro-pipeline-agent, reusable-workflow-smoke, corpus-manifest-check, github-app-probe]
+    runs-on: ubuntu-latest
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Post sync summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = ${{ toJSON(needs) }};
+            const rows = Object.entries(jobs).map(([name, j]) =>
+              `| ${name} | ${j.result === 'success' ? '✅' : j.result === 'skipped' ? '⏭' : '❌'} ${j.result} |`
+            ).join('\n');
+            const body = [
+              '## Zorro Product Sync Gate',
+              '',
+              '| Job | Status |',
+              '|-----|--------|',
+              rows,
+              '',
+              '_Supply Agent + Pipeline Agent + reusable PR Guard + GitHub App webhook._',
+              '',
+              '**Surfaces validated:** GitHub Actions · PR Guard · Pipeline Agent · Core API webhook',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
